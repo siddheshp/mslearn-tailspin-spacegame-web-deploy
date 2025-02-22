@@ -1,13 +1,15 @@
+
 trigger:
 - '*'
 
 variables:
   buildConfiguration: 'Release'
+  releaseBranchName: 'main'
 
 stages:
 - stage: 'Build'
   displayName: 'Build the web application'
-  jobs:
+  jobs: 
   - job: 'Build'
     displayName: 'Build job'
     pool:
@@ -17,7 +19,7 @@ stages:
 
     variables:
       wwwrootDir: 'Tailspin.SpaceGame.Web/wwwroot'
-      dotnetSdkVersion: '5.x'
+      dotnetSdkVersion: '6.x'
 
     steps:
     - task: UseDotNet@2
@@ -68,6 +70,12 @@ stages:
 - stage: 'Dev'
   displayName: 'Deploy to the dev environment'
   dependsOn: Build
+  condition: |
+    and
+    (
+      succeeded(),
+      eq(variables['Build.SourceBranchName'], variables['releaseBranchName'])
+    )
   jobs:
   - deployment: Deploy
     pool:
@@ -81,55 +89,65 @@ stages:
           steps:
           - download: current
             artifact: drop
+
+          # Add Azure CLI task to create the web app if it doesn't exist
+          - task: AzureCLI@2
+            displayName: 'Create Azure Web App if not exists'
+            inputs:
+              azureSubscription: 'ARM-Connection'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                # Define variables
+                RESOURCE_GROUP="rg-demo"
+                APP_SERVICE_PLAN="asp-siddhesh7655"
+                WEBAPP_NAME="$(WebAppNameDev)"
+                LOCATION="eastus2"
+
+                # Check if web app exists
+                EXISTING_APP=$(az webapp show --name $WEBAPP_NAME --resource-group $RESOURCE_GROUP --query "id" --output tsv 2>/dev/null)
+
+                if [[ -z "$EXISTING_APP" ]]; then
+                  echo "Web app does not exist. Creating..."
+                  
+                  # Ensure App Service Plan exists
+                  az appservice plan create --name $APP_SERVICE_PLAN --resource-group $RESOURCE_GROUP --sku B1 --is-linux || exit 1
+                  
+                  # Create Web App
+                  az webapp create --name $WEBAPP_NAME --resource-group $RESOURCE_GROUP --plan $APP_SERVICE_PLAN --runtime "DOTNETCORE:6.0" || exit 1
+                  
+                  echo "Web app created successfully."
+                else
+                  echo "Web app already exists. Skipping creation."
+                fi
+
           - task: AzureWebApp@1
             displayName: 'Azure App Service Deploy: website'
             inputs:
-              azureSubscription: 'Resource Manager - Tailspin - Space Game'
+              azureSubscription: 'ARM-Connection'
               appName: '$(WebAppNameDev)'
               package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*.zip'
-
-- stage: 'Test'
-  displayName: 'Deploy to the test environment'
-  dependsOn: Dev
-  jobs:
-  - deployment: Deploy
+              appType: webAppLinux
+  - job: RunLoadTests
+    dependsOn: Deploy
+    displayName: 'Run load tests'
     pool:
       vmImage: 'ubuntu-20.04'
-    environment: test
     variables:
-    - group: 'Release'
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - download: current
-            artifact: drop
-          - task: AzureWebApp@1
-            displayName: 'Azure App Service Deploy: website'
-            inputs:
-              azureSubscription: 'Resource Manager - Tailspin - Space Game'
-              appName: '$(WebAppNameTest)'
-              package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*.zip'
-
-- stage: 'Staging'
-  displayName: 'Deploy to the staging environment'
-  dependsOn: Test
-  jobs:
-  - deployment: Deploy
-    pool:
-      vmImage: 'ubuntu-20.04'
-    environment: staging
-    variables:
-    - group: 'Release'
-    strategy:
-      runOnce:
-        deploy:
-          steps:
-          - download: current
-            artifact: drop
-          - task: AzureWebApp@1
-            displayName: 'Azure App Service Deploy: website'
-            inputs:
-              azureSubscription: 'Resource Manager - Tailspin - Space Game'
-              appName: '$(WebAppNameStaging)'
-              package: '$(Pipeline.Workspace)/drop/$(buildConfiguration)/*.zip'
+    - group: Release
+    steps:
+    - script: |
+        wget -c archive.apache.org/dist/jmeter/binaries/apache-jmeter-$(jmeterVersion).tgz
+        tar -xzf apache-jmeter-$(jmeterVersion).tgz
+      displayName: 'Install Apache JMeter'
+    - script: apache-jmeter-$(jmeterVersion)/bin/./jmeter -n -t LoadTest.jmx -o Results.xml -Jhostname=$(STAGING_HOSTNAME)
+      displayName: 'Run Load tests'
+    - script: |
+        sudo apt-get update
+        sudo apt-get install xsltproc
+        xsltproc JMeter2JUnit.xsl Results.xml > JUnit.xml
+      displayName: 'Transform JMeter output to JUnit'
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: JUnit.xml         
